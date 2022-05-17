@@ -3,6 +3,7 @@ import org.http4s.client._
 import org.http4s.client.dsl.io._
 import org.http4s.Uri
 import org.http4s.Request
+import org.http4s.Status
 import org.http4s.headers._
 import org.http4s.MediaType._
 import org.http4s.Method._
@@ -29,8 +30,7 @@ object MubuExporter extends IOApp.Simple {
     for{
       request <- buildRequest(target)
       token <- getJWTtoken(request)
-    } yield IO{println(token)}
-    
+    } yield println(token)
   }
   
   def buildRequest(url: Uri): IO[Request[IO]] = {
@@ -50,9 +50,16 @@ object MubuExporter extends IOApp.Simple {
   }
 
   def getJWTtoken(request: Request[IO])(implicit client: Client[IO]): IO[String] = {
-    val login = client.expect[Json](request)
+    val login = client.run(request).use{
+      case Status.Successful(res) => res.attemptAs[Json].value
+      case res => res.as[String].map(b => Left(s"Request $request failed with status ${res.status.code} and body $b"))
+    }
     val _tokenPath = root.data.token.string
-    val token = login.map(json => _tokenPath.getOption(json).getOrElse("No token"))
+
+    val token = login.map( json => json match {
+      case Right(j) => _tokenPath.getOption(j).getOrElse("No token")
+      case Left(e)  => s"Error happened ${e}"
+    })
     token
   }
 
