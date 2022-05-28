@@ -3,6 +3,7 @@ import org.http4s.client._
 import org.http4s.client.dsl.io._
 import org.http4s.{Uri, Request, Status, Header}
 import org.http4s.headers._
+import org.http4s.headers.Origin
 import org.http4s.MediaType._
 import org.http4s.Method._
 import org.http4s.circe._
@@ -24,6 +25,7 @@ import cats.instances.duration
 import org.http4s.syntax.header
 import scala.io.StdIn.readLine
 import cats.data.EitherTMonad
+import java.util.jar.Attributes.Name
 
 object MubuExporter extends IOApp.Simple {
   import Model._
@@ -58,7 +60,7 @@ object MubuExporter extends IOApp.Simple {
         .parTraverseN(2)(fileReq =>
           EitherT(mubuClient.getSingleDocContent(fileReq))
         )
-
+      _ <- EitherT.right(fileListContent.map(println).pure[IO])
       filesListExportReq <- fileListContent.parTraverse(fileSingleContent =>
         EitherT(
           reqBuilder
@@ -67,12 +69,11 @@ object MubuExporter extends IOApp.Simple {
         )
       )
 
-      // filesListExport <- filesListExportReq.parTraverse(
-      //   fileSingleReq =>
-      //     EitherT(mubuClient.exportSingleDocContent(fileSingleReq))
-      // )
-      
-    } yield filesListExportReq
+      filesListExport <- filesListExportReq.traverse(fileSingleReq =>
+        EitherT(mubuClient.exportSingleDocContent(fileSingleReq))
+      )
+
+    } yield filesListExport
 
     // val files = filesListContent.flatMap(
     //     _
@@ -182,7 +183,7 @@ object Mubu {
   trait Mubu[F[_]] {
     def getJWTtoken(request: Request[F]): F[EitherMsg[String]]
     def getAllFilesList(request: Request[F]): F[EitherMsg[List[String]]]
-    def getSingleDocContent(request: Request[F]): F[EitherMsg[String]]
+    def getSingleDocContent(request: Request[F]): F[EitherMsg[TitleContent]]
     def exportSingleDocContent(request: Request[F]): F[EitherMsg[Array[Byte]]]
   }
 
@@ -195,7 +196,7 @@ object Mubu {
     ): F[Request[F]]
     def buildExportSingleDocContentRequest(
         token: String,
-        content: String
+        titleContent: TitleContent
     ): F[Request[F]]
   }
 
@@ -253,15 +254,22 @@ object Mubu {
 
     override def buildExportSingleDocContentRequest(
         token: String,
-        content: String
+        titleContent: TitleContent
     ): F[Request[F]] = {
 
       val uri = Uri.unsafeFromString(RoutePath.EXPORT_SINGLE_DOC_PATH)
       val request = for {
-        singleDocContent <- SingleDocContent(definition = content).asJson.pure(Sync[F])
-        header <- Header("jwt-token", token).pure(Sync[F])
+        singleDocContent <- SingleDocContent(
+          definition = titleContent.content,
+          title = titleContent.title
+        ).asJson
+          .pure(Sync[F])
+        _ <- println(singleDocContent).pure(Sync[F])
+        header1 <- Header("jwt-token", token).pure(Sync[F])
+        header2 <- Origin.parse("https://mubu.com").pure(Sync[F])
+        header3 <- Header("referer", "https://mubu.com/app/edit/home/1ao04CtUqE0").pure(Sync[F])
       } yield Request[F](POST, uri)
-        .withHeaders(header)
+        .putHeaders(header1, header2, header3)
         .withEntity[Json](singleDocContent)
 
       request
@@ -287,7 +295,7 @@ object Mubu {
             .as[String]
             .map(b =>
               Left(
-                s"Request $request failed with status ${res.status.code} and body $b"
+                s"Request ${request.entity}  failed with status ${res.status.code} and body $b"
               )
             )
       }
@@ -322,7 +330,8 @@ object Mubu {
       val result = EitherT(res)
         .leftMap(e => ErrorMsg(e))
         .map(value => {
-          _fileListPath.getAll(value)
+          _fileListPath
+            .getAll(value)
         })
         .value
 
@@ -331,7 +340,7 @@ object Mubu {
 
     override def getSingleDocContent(
         request: Request[F]
-    ): F[EitherMsg[String]] = {
+    ): F[EitherMsg[TitleContent]] = {
       val res: F[Either[String, Json]] = client.run(request).use {
         case Status.Successful(res) =>
           res
@@ -343,20 +352,23 @@ object Mubu {
             .as[String]
             .map(b =>
               Left(
-                s"Request $request failed with status ${res.status.code} and body $b"
+                s"Request $request failed with status ${res.status.code} and body $b and ${res.headers}"
               )
             )
       }
 
       val _doc_content_path = root.data.definition.string
+      val _doc_title_path = root.data.name.string
 
       val result = EitherT(res)
         .leftMap(e => ErrorMsg(e))
         .flatMap(value => {
+          val definition = _doc_content_path.getOption(value)
+          val title = _doc_title_path.getOption(value)
           EitherT.fromEither[F](
-            _doc_content_path
-              .getOption(value)
-              .fold[Either[ErrorMsg, String]](
+            definition
+              .map2(title)((df, tit) => TitleContent(tit, df))
+              .fold[Either[ErrorMsg, TitleContent]](
                 Left(ErrorMsg(s"can't get single doc content ${value}"))
               )(Right(_))
           )
@@ -374,6 +386,10 @@ object Mubu {
           res
             .attemptAs[Array[Byte]]
             .leftMap(e => ErrorMsg(s"Decode Single doc to json error"))
+            .map(b => {
+              println(s"Get export data here $b")
+              b
+            })
             .value
         case res =>
           res
@@ -381,7 +397,7 @@ object Mubu {
             .map(b =>
               Left(
                 ErrorMsg(
-                  s"Request $request failed with status ${res.status.code} and body $b"
+                  s"Request ${request.headers} failed with status ${res.status.code} and body $b and res headers ${res.headers}"
                 )
               )
             )
@@ -415,6 +431,17 @@ object Model {
 
   case class SingleDocContent(
       definition: String,
-      `type`: String = "pdf"
+      `type`: String = "pdf",
+      title: String
+  )
+
+  case class NameId(
+      name: String,
+      id: String
+  )
+
+  case class TitleContent(
+      title: String,
+      content: String
   )
 }
